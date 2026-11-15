@@ -1,0 +1,15 @@
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: gobus-service
+  namespace: gobus
+spec:
+  type: LoadBalancer
+  selector:
+    app: gobus-backend
+  ports:
+    - port: 80
+      targetPort: 5000
+      protocol: TCP
+
