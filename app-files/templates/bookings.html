@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GoBus - My Bookings</title>
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+
+<header>
+    <h1>GoBus</h1>
+    <p>My Bookings</p>
+</header>
+
+<div class="container">
+
+    <h2>Find Your Tickets</h2>
+
+    <form method="GET" action="/my-bookings">
+
+        <label>Phone Number</label>
+
+        <input type="text"
+               name="phone"
+               value="{{ phone }}"
+               required>
+
+        <button type="submit">Search</button>
+
+    </form>
+
+    {% if phone and not bookings %}
+        <p>No bookings found.</p>
+    {% endif %}
+
+    {% for booking in bookings %}
+
+    <div class="bus-card">
+
+        <h3>Booking ID: {{ booking.id }}</h3>
+
+        <p>Passenger: {{ booking.passenger }}</p>
+        <p>Bus: {{ booking.operator }}</p>
+
+        <p>
+            Route:
+            {{ booking.source }}
+            →
+            {{ booking.destination }}
+        </p>
+
+        <p>Departure: {{ booking.departure_time }}</p>
+        <p>Seats: {{ booking.seats }}</p>
+        <p>Total Amount: ₹{{ booking.total_amount }}</p>
+
+    </div>
+
+    {% endfor %}
+
+    <a href="/">Back to Home</a>
+
+</div>
+
+</body>
+</html>
