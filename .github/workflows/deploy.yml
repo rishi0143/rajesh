@@ -17,16 +17,16 @@ env:
   NAMESPACE: gobus
 
 jobs:
-  build-and-deploy:
-    name: Build and Deploy GoBus
+  build-push-hpa:
+    name: Docker Build Push and HPA Setup
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout GitHub repository
+      # 1. Checkout source code
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Generate image tag
+      # 2. Set image tag
       - name: Set Image Tag
         run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
@@ -44,17 +44,13 @@ jobs:
             -t "$DOCKER_IMAGE:$IMAGE_TAG" \
             -f app-files/Dockerfile \
             app-files
-
       # 5. Push Docker image
       - name: Push Docker Image
         run: |
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
-
           docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
-
           docker push "$DOCKER_IMAGE:latest"
-
-      # 6. Configure AWS credentials using IAM User
+      # 6. Configure AWS using Access Keys
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -66,7 +62,6 @@ jobs:
       - name: Verify AWS Identity
         run: |
           aws sts get-caller-identity
-
       # 8. Install kubectl
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
@@ -79,105 +74,24 @@ jobs:
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER_NAME"
-
           kubectl get nodes
-
-      # 10. Create namespace
-      - name: Create Namespace
-        run: |
-          kubectl create namespace "$NAMESPACE" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      # 11. Create RDS database secret
-      - name: Configure Database Secret
-        env:
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_NAME: ${{ secrets.DB_NAME }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-        run: |
-          if [ -z "$DB_HOST" ] || [ -z "$DB_NAME" ] || \
-             [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ]; then
-            echo "Database GitHub Secrets are missing."
-            exit 1
-          fi
-
-          kubectl create secret generic gobus-db-secret \
-            -n "$NAMESPACE" \
-            --from-literal=DB_HOST="$DB_HOST" \
-            --from-literal=DB_NAME="$DB_NAME" \
-            --from-literal=DB_USER="$DB_USER" \
-            --from-literal=DB_PASSWORD="$DB_PASSWORD" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      # 12. Install Metrics Server
+      # 10. Install Metrics Server
       - name: Install Metrics Server
         run: |
-          kubectl apply -f \
-            https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      # 11. Verify Metrics Server
+      - name: Verify Metrics Server
+        run: |
           kubectl rollout status deployment/metrics-server \
             -n kube-system \
             --timeout=180s
-
-      # 13. Deploy Kubernetes manifests
-      - name: Deploy GoBus Application
-        run: |
-          kubectl apply -f k8t/deployment.yaml -n "$NAMESPACE"
-          kubectl apply -f k8t/service.yaml -n "$NAMESPACE"
-
-      # 14. Update Docker image
-      - name: Update GoBus Image
-        run: |
-          kubectl set image deployment/gobus-backend \
-            gobus-backend="$DOCKER_IMAGE:$IMAGE_TAG" \
-            -n "$NAMESPACE"
-
-      # 15. Verify rollout
-      - name: Verify Deployment
-        run: |
-          kubectl rollout status deployment/gobus-backend \
-            -n "$NAMESPACE" \
-            --timeout=300s
-
-      # 16. Apply HPA
+      # 12. Apply HPA
       - name: Apply HPA
         run: |
-          kubectl apply -f k8t/hpa.yaml -n "$NAMESPACE"
-
-      # 17. Final verification
-      - name: Final Verification
+          kubectl apply -f k8t/hpa.yaml
+      # 13. Verify HPA
+      - name: Verify HPA
         run: |
-          echo "===== AWS IDENTITY ====="
-          aws sts get-caller-identity
-
-          echo "===== EKS NODES ====="
-          kubectl get nodes
-
-          echo "===== GOBUS PODS ====="
-          kubectl get pods -n "$NAMESPACE" -o wide
-
-          echo "===== GOBUS SERVICES ====="
-          kubectl get svc -n "$NAMESPACE"
-
-          echo "===== HPA ====="
           kubectl get hpa -n "$NAMESPACE"
-
-          echo "===== POD METRICS ====="
-          kubectl top pods -n "$NAMESPACE" || true
-
-      # 18. Debug when pipeline fails
-      - name: Debug Failure
-        if: failure()
-        run: |
-          kubectl get pods -n "$NAMESPACE" -o wide || true
-
-          kubectl get events -n "$NAMESPACE" \
-            --sort-by=.lastTimestamp || true
-
-          kubectl get hpa -n "$NAMESPACE" || true
-
-          kubectl logs deployment/gobus-backend \
-            -n "$NAMESPACE" \
-            --all-containers=true \
-            --tail=100 || true
+          kubectl describe hpa gobus-hpa -n "$NAMESPACE"
+          kubectl top pods -n "$NAMESPACE"
