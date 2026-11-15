@@ -18,7 +18,7 @@ env:
 
 jobs:
   build-push-hpa:
-    name: Docker Build Push and HPA Setup
+    name: Docker Build Push and EKS HPA Setup
     runs-on: ubuntu-latest
 
     steps:
@@ -44,13 +44,15 @@ jobs:
             -t "$DOCKER_IMAGE:$IMAGE_TAG" \
             -f app-files/Dockerfile \
             app-files
+
       # 5. Push Docker image
       - name: Push Docker Image
         run: |
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
           docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
           docker push "$DOCKER_IMAGE:latest"
-      # 6. Configure AWS using Access Keys
+
+      # 6. Configure AWS using IAM User Access Keys
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -58,40 +60,130 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 7. Verify AWS identity
+      # 7. Verify AWS Identity
       - name: Verify AWS Identity
         run: |
+          echo "Checking AWS identity..."
           aws sts get-caller-identity
-      # 8. Install kubectl
+
+          ACTUAL_ARN=$(aws sts get-caller-identity --query Arn --output text)
+          EXPECTED_ARN="arn:aws:iam::479537130944:user/gobus-github-deploy"
+
+          echo "Actual ARN: $ACTUAL_ARN"
+
+          if [ "$ACTUAL_ARN" != "$EXPECTED_ARN" ]; then
+            echo "ERROR: Incorrect AWS IAM identity!"
+            echo "Expected: $EXPECTED_ARN"
+            exit 1
+          fi
+
+          echo "AWS IAM identity verified successfully."
+
+      # 8. Setup kubectl
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: v1.34.0
 
-      # 9. Connect to EKS
+      # 9. Check EKS authentication mode
+      - name: Check EKS Authentication Mode
+        run: |
+          aws eks describe-cluster \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --query "cluster.accessConfig.authenticationMode" \
+            --output text
+
+      # 10. Connect and authenticate to EKS
       - name: Connect to EKS
         run: |
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER_NAME"
+
+          echo "Testing Kubernetes authentication..."
           kubectl get nodes
-      # 10. Install Metrics Server
+
+      # 11. Create namespace
+      - name: Create Namespace
+        run: |
+          kubectl apply -f k8t/namespace.yaml
+          kubectl get namespace "$NAMESPACE"
+
+      # 12. Install Metrics Server
       - name: Install Metrics Server
         run: |
           kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-      # 11. Verify Metrics Server
+
+      # 13. Verify Metrics Server
       - name: Verify Metrics Server
         run: |
           kubectl rollout status deployment/metrics-server \
             -n kube-system \
             --timeout=180s
-      # 12. Apply HPA
+
+      # 14. Deploy GoBus application
+      - name: Deploy GoBus Application
+        run: |
+          kubectl apply -f k8t/deployment.yaml -n "$NAMESPACE"
+          kubectl apply -f k8t/service.yaml -n "$NAMESPACE"
+
+      # 15. Update Docker image
+      - name: Update GoBus Image
+        run: |
+          kubectl set image deployment/gobus-backend \
+            gobus-backend="$DOCKER_IMAGE:$IMAGE_TAG" \
+            -n "$NAMESPACE"
+
+      # 16. Verify deployment
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/gobus-backend \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+      # 17. Apply HPA
       - name: Apply HPA
         run: |
-          kubectl apply -f k8t/hpa.yaml
-      # 13. Verify HPA
+          kubectl apply -f k8t/hpa.yaml -n "$NAMESPACE"
+
+      # 18. Verify HPA
       - name: Verify HPA
         run: |
           kubectl get hpa -n "$NAMESPACE"
           kubectl describe hpa gobus-hpa -n "$NAMESPACE"
-          kubectl top pods -n "$NAMESPACE"
+
+      # 19. Final verification
+      - name: Final Verification
+        run: |
+          echo "===== AWS Identity ====="
+          aws sts get-caller-identity
+
+          echo "===== EKS Nodes ====="
+          kubectl get nodes
+
+          echo "===== GoBus Pods ====="
+          kubectl get pods -n "$NAMESPACE" -o wide
+
+          echo "===== Services ====="
+          kubectl get svc -n "$NAMESPACE"
+
+          echo "===== HPA ====="
+          kubectl get hpa -n "$NAMESPACE"
+
+          echo "===== Pod Metrics ====="
+          kubectl top pods -n "$NAMESPACE" || true
+
+      # 20. Debug if pipeline fails
+      - name: Debug Failure
+        if: failure()
+        run: |
+          kubectl get nodes || true
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get events -n "$NAMESPACE" \
+            --sort-by=.lastTimestamp || true
+          kubectl get hpa -n "$NAMESPACE" || true
+          kubectl logs deployment/gobus-backend \
+            -n "$NAMESPACE" \
+            --all-containers=true \
+            --tail=100 || true
