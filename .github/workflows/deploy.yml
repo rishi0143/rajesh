@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -23,36 +22,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # 1. Checkout GitHub Repository
       - name: Git Checkout
         uses: actions/checkout@v4
 
-      # 2. Generate Image Tag
       - name: Set Image Tag
         run: |
           echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      # 3. Docker Hub Login
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 4. Build Docker Image
       - name: Build Docker Image
         run: |
           docker build -t "$DOCKER_IMAGE:$IMAGE_TAG" .
           docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
 
-      # 5. Push Docker Image
       - name: Push Docker Image
         run: |
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS Credentials
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -60,37 +52,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 7. Verify AWS Identity
       - name: Verify AWS Identity
         run: |
           aws sts get-caller-identity
 
-          ACCOUNT_ID=$(aws sts get-caller-identity \
-            --query Account --output text)
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
 
-          if [ "$ACCOUNT_ID" != "479537130944" ]; then
-            echo "Wrong AWS Account"
-            exit 1
-          fi
-
-          CALLER_ARN=$(aws sts get-caller-identity \
-            --query Arn --output text)
-
-          echo "AWS Identity: $CALLER_ARN"
-
-          if [ "$CALLER_ARN" != \
-            "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
+          if [ "$CALLER_ARN" != "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
             echo "Wrong IAM User"
             exit 1
           fi
 
-      # 8. Setup kubectl
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: v1.34.0
 
-      # 9. Connect to EKS
       - name: Connect to EKS
         run: |
           aws eks update-kubeconfig \
@@ -99,111 +76,80 @@ jobs:
 
           kubectl get nodes
 
-      # 10. Install Metrics Server
+      - name: Deploy Python Application
+        run: |
+          kubectl apply -f k8s/deployment.yaml -n "$NAMESPACE"
+
+          kubectl set image deployment/pyapp \
+            pyapp="$DOCKER_IMAGE:$IMAGE_TAG" \
+            -n "$NAMESPACE"
+
+          kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
       - name: Install Metrics Server
         run: |
           kubectl apply -f \
             https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-      # 11. Verify Metrics Server
       - name: Verify Metrics Server
         run: |
           kubectl rollout status deployment/metrics-server \
             -n kube-system \
             --timeout=180s
 
-          kubectl get deployment metrics-server \
-            -n kube-system
-
-      # 12. Wait for Metrics API
       - name: Wait for Metrics API
         run: |
-          for i in {1..12}; do
+          for i in {1..18}; do
             if kubectl top nodes; then
               echo "Metrics API is ready"
               exit 0
             fi
 
-            echo "Waiting for Metrics Server..."
+            echo "Waiting for Metrics API..."
             sleep 10
           done
 
           echo "Metrics API is not ready"
           exit 1
 
-      # 13. Deploy Application
-      - name: Deploy Python Application
-        run: |
-          kubectl apply -f k8s/deployment.yaml \
-            -n "$NAMESPACE"
-
-          kubectl apply -f k8s/service.yaml \
-            -n "$NAMESPACE"
-
-      # 14. Update Application Image
-      - name: Update Application Image
-        run: |
-          kubectl set image deployment/pyapp \
-            pyapp="$DOCKER_IMAGE:$IMAGE_TAG" \
-            -n "$NAMESPACE"
-
-      # 15. Verify Deployment
-      - name: Verify Deployment
-        run: |
-          kubectl rollout status deployment/pyapp \
-            -n "$NAMESPACE" \
-            --timeout=300s
-
-      # 16. Apply HPA
       - name: Apply HPA
         run: |
-          kubectl apply -f k8s/hpa.yaml \
-            -n "$NAMESPACE"
+          kubectl apply -f k8s/hpa.yaml -n "$NAMESPACE"
 
-      # 17. Verify HPA
       - name: Verify HPA
         run: |
           kubectl get hpa -n "$NAMESPACE"
-          kubectl describe hpa pyapp-hpa \
-            -n "$NAMESPACE"
+          kubectl describe hpa pyapp-hpa -n "$NAMESPACE"
 
-      # 18. Final Verification
       - name: Final Verification
         run: |
           echo "===== EKS Nodes ====="
           kubectl get nodes
 
           echo "===== Application Pods ====="
-          kubectl get pods -n "$NAMESPACE" -o wide
+          kubectl get pods -n "$NAMESPACE"
 
-          echo "===== Services ====="
-          kubectl get svc -n "$NAMESPACE"
+          echo "===== Deployment ====="
+          kubectl get deployment pyapp -n "$NAMESPACE"
 
-          echo "===== HPA Status ====="
+          echo "===== Metrics Server ====="
+          kubectl get deployment metrics-server -n kube-system
+
+          echo "===== HPA ====="
           kubectl get hpa -n "$NAMESPACE"
 
-          echo "===== Pod CPU and Memory ====="
-          kubectl top pods -n "$NAMESPACE" || true
+          echo "===== Pod Metrics ====="
+          kubectl top pods -n "$NAMESPACE"
 
-      # 19. Debug Failure
       - name: Debug Failure
         if: failure()
         run: |
           kubectl get nodes || true
-
-          kubectl get pods \
-            -n "$NAMESPACE" -o wide || true
-
-          kubectl get svc \
-            -n "$NAMESPACE" || true
-
-          kubectl get events \
-            -n "$NAMESPACE" \
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get hpa -n "$NAMESPACE" || true
+          kubectl get events -n "$NAMESPACE" \
             --sort-by=.lastTimestamp || true
-
-          kubectl get hpa \
-            -n "$NAMESPACE" || true
-
           kubectl logs deployment/pyapp \
-            -n "$NAMESPACE" \
-            --tail=100 || true
+            -n "$NAMESPACE" --tail=100 || true
