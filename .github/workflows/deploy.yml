@@ -1,5 +1,4 @@
 
-
 name: GoBus-Docker-EKS-HPA-CI-CD
 
 on:
@@ -18,16 +17,16 @@ env:
   NAMESPACE: gobus
 
 jobs:
-  build-push-hpa:
-    name: Docker Build Push and HPA Setup
+  build-and-deploy:
+    name: Build Docker and Deploy to EKS
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout source code
+      # 1. Checkout repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Set image tag
+      # 2. Generate image tag
       - name: Set Image Tag
         run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
@@ -50,12 +49,10 @@ jobs:
       - name: Push Docker Image
         run: |
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
-
           docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
-
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS using Access Keys
+      # 6. AWS Access Key authentication (NO OIDC)
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -80,29 +77,61 @@ jobs:
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER_NAME"
-
           kubectl get nodes
 
-      # 10. Install Metrics Server
+      # 10. Create namespace
+      - name: Create Namespace
+        run: |
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # 11. Install Metrics Server
       - name: Install Metrics Server
         run: |
           kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-      # 11. Verify Metrics Server
+      # 12. Wait for Metrics Server
       - name: Verify Metrics Server
         run: |
           kubectl rollout status deployment/metrics-server \
             -n kube-system \
             --timeout=180s
 
-      # 12. Apply HPA
+      # 13. Deploy GoBus
+      - name: Deploy GoBus Application
+        run: |
+          kubectl apply -f k8t/deployment.yaml
+          kubectl apply -f k8t/service.yaml
+
+      # 14. Update Docker image
+      - name: Update GoBus Image
+        run: |
+          kubectl set image deployment/gobus-backend \
+            gobus-backend="$DOCKER_IMAGE:$IMAGE_TAG" \
+            -n "$NAMESPACE"
+
+      # 15. Verify deployment
+      - name: Verify GoBus Deployment
+        run: |
+          kubectl rollout status deployment/gobus-backend \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+      # 16. Apply HPA
       - name: Apply HPA
         run: |
           kubectl apply -f k8t/hpa.yaml
 
-      # 13. Verify HPA
+      # 17. Verify HPA
       - name: Verify HPA
         run: |
           kubectl get hpa -n "$NAMESPACE"
           kubectl describe hpa gobus-hpa -n "$NAMESPACE"
-          kubectl top pods -n "$NAMESPACE"
+
+     
+      - name: Debug Failure
+        if: failure()
+        run: |
+          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get events -n "$NAMESPACE" \
+            -
