@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,9 +14,11 @@ env:
   AWS_REGION: ap-south-1
   EKS_CLUSTER_NAME: my-eks-cluster5
   DOCKER_IMAGE: rishi784/gha-pyapp
+  NAMESPACE: default
 
 jobs:
   PythonCI:
+    name: Python Docker EKS HPA CI-CD
     runs-on: ubuntu-latest
 
     steps:
@@ -26,24 +29,24 @@ jobs:
       # 2. Generate image tag
       - name: Set Image Tag
         run: |
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      # 3. Build Docker image
-      - name: Build Docker Image
-        run: |
-          docker build -t $DOCKER_IMAGE:$IMAGE_TAG .
-
-      # 4. Login to Docker Hub
+      # 3. Login to Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # 4. Build Docker image
+      - name: Build Docker Image
+        run: |
+          docker build -t "$DOCKER_IMAGE:$IMAGE_TAG" .
+
       # 5. Push Docker image
       - name: Push Docker Image
         run: |
-          docker push $DOCKER_IMAGE:$IMAGE_TAG
+          docker push "$DOCKER_IMAGE:$IMAGE_TAG"
 
       # 6. Configure AWS Credentials
       - name: Configure AWS Credentials
@@ -51,13 +54,73 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
       # 7. Verify AWS Identity
       - name: Verify AWS Identity
         run: |
           aws sts get-caller-identity
 
-          echo "Trivy Image Scan Completed"
+      # 8. Setup kubectl
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
 
+      # 9. Connect to EKS
+      - name: Connect to EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
 
+          kubectl get nodes
+
+      # 10. Install Metrics Server
+      - name: Install Metrics Server
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+      # 11. Verify Metrics Server
+      - name: Verify Metrics Server
+        run: |
+          kubectl rollout status deployment/metrics-server \
+            -n kube-system \
+            --timeout=180s
+
+          kubectl get deployment metrics-server -n kube-system
+
+      # 12. Deploy application
+      - name: Deploy Python Application
+        run: |
+          kubectl apply -f k8s/deployment.yaml -n "$NAMESPACE"
+          kubectl apply -f k8s/service.yaml -n "$NAMESPACE"
+
+      # 13. Update Docker image
+      - name: Update Application Image
+        run: |
+          kubectl set image deployment/pyapp \
+            pyapp="$DOCKER_IMAGE:$IMAGE_TAG" \
+            -n "$NAMESPACE"
+
+      # 14. Verify deployment
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" \
+            --timeout=300s
+
+      # 15. Apply HPA
+      - name: Apply HPA
+        run: |
+          kubectl apply -f k8s/hpa.yaml -n "$NAMESPACE"
+
+      # 16. Verify HPA
+      - name: Verify HPA
+        run: |
+          kubectl get hpa -n "$NAMESPACE"
+          kubectl describe hpa pyapp-hpa -n "$NAMESPACE"
+
+          kubectl get hpa -n "$NAMESPACE" || true
+          kubectl logs deployment/pyapp \
+            -n "$NAMESPACE" --tail=100 || true
