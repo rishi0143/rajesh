@@ -23,12 +23,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # 1. Checkout
+      # 1. Checkout source code
       - name: Git Checkout
         uses: actions/checkout@v4
 
-      # 2. Generate Image Tag
+      # 2. Generate unique image tag
       - name: Set Image Tag
         run: |
           echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
@@ -43,8 +42,12 @@ jobs:
       # 4. Build Docker Image
       - name: Build Docker Image
         run: |
-          docker build -t "$DOCKER_IMAGE:$IMAGE_TAG" .
-          docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
+          docker build \
+            -t "$DOCKER_IMAGE:$IMAGE_TAG" .
+
+          docker tag \
+            "$DOCKER_IMAGE:$IMAGE_TAG" \
+            "$DOCKER_IMAGE:latest"
 
       # 5. Push Docker Image
       - name: Push Docker Image
@@ -52,7 +55,7 @@ jobs:
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS
+      # 6. Configure AWS Credentials
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -89,7 +92,7 @@ jobs:
 
           kubectl get nodes
 
-      # 10. Create Namespace
+      # 10. Apply Namespace
       - name: Apply Namespace
         run: |
           kubectl apply -f k8t/namespace.yaml
@@ -154,7 +157,7 @@ jobs:
         run: |
           kubectl get hpa -n "$NAMESPACE"
 
-          kubectl describe hpa pyapp-hpa \
+          kubectl describe hpa gobus-hpa \
             -n "$NAMESPACE"
 
       # 17. Final Verification
@@ -182,6 +185,11 @@ jobs:
           echo "===== Pod Metrics ====="
           kubectl top pods -n "$NAMESPACE"
 
+          echo "===== Deployed Image ====="
+          kubectl get deployment pyapp \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+
       # 18. Debug Failure
       - name: Debug Failure
         if: failure()
@@ -190,6 +198,9 @@ jobs:
 
           kubectl get pods \
             -n "$NAMESPACE" -o wide || true
+
+          kubectl get deployment \
+            -n "$NAMESPACE" || true
 
           kubectl get svc \
             -n "$NAMESPACE" || true
