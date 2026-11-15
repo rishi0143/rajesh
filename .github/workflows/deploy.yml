@@ -19,17 +19,23 @@ env:
 
 jobs:
   build-push-hpa:
-    name: Docker Build Push and HPA Setup
+    name: Build, Push and Configure HPA
     runs-on: ubuntu-latest
 
+    # Required for GitHub OIDC authentication
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
-      # 1. Checkout source code
+      # 1. Checkout GitHub repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Create image tag
+      # 2. Generate Docker image tag
       - name: Set Image Tag
-        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       # 3. Docker Hub login
       - name: Docker Hub Login
@@ -42,30 +48,59 @@ jobs:
       - name: Build Docker Image
         run: |
           docker build \
-            -t $DOCKER_IMAGE:$IMAGE_TAG \
+            -t "$DOCKER_IMAGE:$IMAGE_TAG" \
             -f app-files/Dockerfile \
             app-files
 
       # 5. Push Docker image
       - name: Push Docker Image
         run: |
-          docker push $DOCKER_IMAGE:$IMAGE_TAG
-          docker tag $DOCKER_IMAGE:$IMAGE_TAG $DOCKER_IMAGE:latest
-          docker push $DOCKER_IMAGE:latest
+          docker push "$DOCKER_IMAGE:$IMAGE_TAG"
 
-      # 7. Connect to EKS
+          docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
+
+          docker push "$DOCKER_IMAGE:latest"
+
+      # 6. Configure AWS using GitHub OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::479537130944:role/gobus-github-deploy
+          role-session-name: GitHubActionsGoBus
+          aws-region: ap-south-1
+
+      # 7. Verify AWS authentication
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      # 8. Install kubectl
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
+
+      # 9. Connect to EKS
       - name: Connect to EKS
         run: |
           aws eks update-kubeconfig \
-            --region $AWS_REGION \
-            --name $EKS_CLUSTER_NAME
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
 
-      # 8. Install Metrics Server
+          kubectl get nodes
+
+      # 10. Create namespace if it does not exist
+      - name: Create Namespace
+        run: |
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # 11. Install Metrics Server
       - name: Install Metrics Server
         run: |
           kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-      # 9. Verify Metrics Server
+      # 12. Verify Metrics Server
       - name: Verify Metrics Server
         run: |
           kubectl rollout status deployment/metrics-server \
@@ -74,14 +109,21 @@ jobs:
 
           kubectl get deployment metrics-server -n kube-system
 
-      # 10. Apply HPA
+      # 13. Check existing application deployment
+      - name: Verify GoBus Deployment
+        run: |
+          kubectl get deployment gobus-backend -n "$NAMESPACE"
+
+      # 14. Apply HPA
       - name: Apply HPA
         run: |
           kubectl apply -f k8t/hpa.yaml
 
-      # 11. Verify HPA
+      # 15. Verify HPA and metrics
       - name: Verify HPA
         run: |
-          kubectl get hpa -n $NAMESPACE
-          kubectl describe hpa gobus-hpa -n $NAMESPACE
-          kubectl top pods -n $NAMESPACE
+          kubectl get hpa -n "$NAMESPACE"
+
+          kubectl describe hpa gobus-hpa -n "$NAMESPACE"
+
+          kubectl top pods -n "$NAMESPACE"
