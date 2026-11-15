@@ -15,7 +15,7 @@ env:
   AWS_REGION: ap-south-1
   EKS_CLUSTER_NAME: gobus-eks
   DOCKER_IMAGE: rishi784/gha-pyapp
-  NAMESPACE: default
+  NAMESPACE: gobus
 
 jobs:
   PythonCI:
