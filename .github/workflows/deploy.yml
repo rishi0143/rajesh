@@ -53,13 +53,6 @@ jobs:
           docker tag $DOCKER_IMAGE:$IMAGE_TAG $DOCKER_IMAGE:latest
           docker push $DOCKER_IMAGE:latest
 
-      # 6. AWS OIDC authentication
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
       # 7. Connect to EKS
       - name: Connect to EKS
         run: |
