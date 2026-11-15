@@ -1,0 +1,11 @@
+aws_region       = "ap-south-1"
+project_name     = "gobus"
+instance_type    = "t3.small"
+db_instance_class = "db.t3.micro"
+
+github_repo_url  = "https://github.com/YOUR_GITHUB_USERNAME/YOUR_NEW_REPOSITORY.git"
+github_repository = "YOUR_GITHUB_USERNAME/YOUR_NEW_REPOSITORY"
+github_branch    = "main"
+
+# Optional. Leave empty to disable SSH and administer with AWS Systems Manager.
+ssh_ingress_cidrs = []

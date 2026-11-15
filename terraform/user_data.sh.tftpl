@@ -1,0 +1,92 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/gobus-bootstrap.log) 2>&1
+
+REGION="${region}"
+SECRET_ARN="${secret_arn}"
+REPO_URL="${repo_url}"
+BRANCH="${branch}"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y docker.io docker-compose-v2 git jq mysql-client curl unzip snapd nginx
+systemctl enable --now docker
+
+# Public HTTP endpoint on port 80; Flask/Gunicorn remains private on localhost:5000.
+cat > /etc/nginx/sites-available/gobus <<'NGINX'
+server {
+    listen 80 default_server;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120;
+    }
+}
+NGINX
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/gobus /etc/nginx/sites-enabled/gobus
+nginx -t
+systemctl enable --now nginx
+
+# Install/enable SSM Agent for secure administration and GitHub Actions deployments.
+if ! systemctl is-active --quiet snap.amazon-ssm-agent.amazon-ssm-agent.service; then
+  snap install amazon-ssm-agent --classic || true
+fi
+systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+
+mkdir -p /opt/gobus
+if [ -d /opt/gobus/app/.git ]; then
+  git -C /opt/gobus/app fetch origin
+  git -C /opt/gobus/app checkout "$${BRANCH}"
+  git -C /opt/gobus/app reset --hard "origin/$${BRANCH}"
+else
+  git clone --branch "$${BRANCH}" "$${REPO_URL}" /opt/gobus/app
+fi
+
+aws secretsmanager get-secret-value \
+  --region "$${REGION}" \
+  --secret-id "$${SECRET_ARN}" \
+  --query SecretString \
+  --output text > /opt/gobus/app-secrets.json
+chmod 600 /opt/gobus/app-secrets.json
+
+jq -r '"ADMIN_USERNAME=" + .ADMIN_USERNAME + "\nADMIN_PASSWORD=" + .ADMIN_PASSWORD + "\nSECRET_KEY=" + .SECRET_KEY' \
+  /opt/gobus/app-secrets.json > /opt/gobus/app/admin.env
+jq -r '"DB_HOST=" + .DB_HOST + "\nDB_PORT=" + .DB_PORT + "\nDB_NAME=" + .DB_NAME + "\nDB_USER=" + .DB_USER + "\nDB_PASSWORD=" + .DB_PASSWORD' \
+  /opt/gobus/app-secrets.json > /opt/gobus/app/db.env
+chmod 600 /opt/gobus/app/admin.env /opt/gobus/app/db.env
+rm -f /opt/gobus/app-secrets.json
+
+cat > /opt/gobus/deploy.sh <<'DEPLOY'
+#!/bin/bash
+set -euo pipefail
+cd /opt/gobus/app
+git fetch origin
+git checkout "$${BRANCH}"
+git reset --hard "origin/$${BRANCH}"
+docker compose up -d --build --remove-orphans
+docker image prune -f
+DEPLOY
+chmod 700 /opt/gobus/deploy.sh
+
+# Wait for private RDS to accept connections, then initialize schema once if supplied.
+DB_HOST=$(grep '^DB_HOST=' /opt/gobus/app/db.env | cut -d= -f2-)
+DB_USER=$(grep '^DB_USER=' /opt/gobus/app/db.env | cut -d= -f2-)
+DB_NAME=$(grep '^DB_NAME=' /opt/gobus/app/db.env | cut -d= -f2-)
+DB_PASSWORD=$(grep '^DB_PASSWORD=' /opt/gobus/app/db.env | cut -d= -f2-)
+for attempt in $(seq 1 60); do
+  if mysqladmin ping -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" --silent; then
+    break
+  fi
+  sleep 10
+done
+if [ -f /opt/gobus/app/schema.sql ]; then
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" < /opt/gobus/app/schema.sql
+fi
+unset DB_PASSWORD
+
+/opt/gobus/deploy.sh
