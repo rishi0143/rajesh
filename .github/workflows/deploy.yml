@@ -1,4 +1,5 @@
 
+
 name: GoBus-Docker-EKS-HPA-CI-CD
 
 on:
@@ -9,7 +10,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   AWS_REGION: ap-south-1
@@ -19,23 +19,17 @@ env:
 
 jobs:
   build-push-hpa:
-    name: Build, Push and Configure HPA
+    name: Docker Build Push and HPA Setup
     runs-on: ubuntu-latest
 
-    # Required for GitHub OIDC authentication
-    permissions:
-      contents: read
-      id-token: write
-
     steps:
-      # 1. Checkout GitHub repository
+      # 1. Checkout source code
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Generate Docker image tag
+      # 2. Set image tag
       - name: Set Image Tag
-        run: |
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       # 3. Docker Hub login
       - name: Docker Hub Login
@@ -61,15 +55,15 @@ jobs:
 
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS using GitHub OIDC
+      # 6. Configure AWS using Access Keys
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::479537130944:role/gobus-github-deploy
-          role-session-name: GitHubActionsGoBus
-          aws-region: ap-south-1
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # 7. Verify AWS authentication
+      # 7. Verify AWS identity
       - name: Verify AWS Identity
         run: |
           aws sts get-caller-identity
@@ -89,41 +83,26 @@ jobs:
 
           kubectl get nodes
 
-      # 10. Create namespace if it does not exist
-      - name: Create Namespace
-        run: |
-          kubectl create namespace "$NAMESPACE" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      # 11. Install Metrics Server
+      # 10. Install Metrics Server
       - name: Install Metrics Server
         run: |
           kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-      # 12. Verify Metrics Server
+      # 11. Verify Metrics Server
       - name: Verify Metrics Server
         run: |
           kubectl rollout status deployment/metrics-server \
             -n kube-system \
             --timeout=180s
 
-          kubectl get deployment metrics-server -n kube-system
-
-      # 13. Check existing application deployment
-      - name: Verify GoBus Deployment
-        run: |
-          kubectl get deployment gobus-backend -n "$NAMESPACE"
-
-      # 14. Apply HPA
+      # 12. Apply HPA
       - name: Apply HPA
         run: |
           kubectl apply -f k8t/hpa.yaml
 
-      # 15. Verify HPA and metrics
+      # 13. Verify HPA
       - name: Verify HPA
         run: |
           kubectl get hpa -n "$NAMESPACE"
-
           kubectl describe hpa gobus-hpa -n "$NAMESPACE"
-
           kubectl top pods -n "$NAMESPACE"
