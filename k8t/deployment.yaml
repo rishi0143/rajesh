@@ -6,17 +6,14 @@ metadata:
   name: pyapp
 spec:
   replicas: 2
-
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 0
       maxUnavailable: 1
-
   selector:
     matchLabels:
       app: pyapp
-
   template:
     metadata:
       labels:
@@ -24,7 +21,7 @@ spec:
     spec:
       containers:
         - name: pyapp
-          image: rishi784/gha-pyapp:0d033ed
+          image: rishi784/gha-pyapp:e0655bf
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
