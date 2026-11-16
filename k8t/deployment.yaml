@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: pyapp
-          image: rishi784/gha-pyapp:93cd015
+          image: rishi784/gha-pyapp:8ff70fd
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
