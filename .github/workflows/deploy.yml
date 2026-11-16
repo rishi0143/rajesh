@@ -33,7 +33,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      # 3. Docker Hub Login
+      # 3. Login to Docker Hub
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -52,7 +52,7 @@ jobs:
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS Credentials
+      # 6. Configure AWS Credentials using old keys
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -65,14 +65,14 @@ jobs:
         run: |
           aws sts get-caller-identity
 
-          CALLER_ARN=$(aws sts get-caller-identity \
-            --query Arn --output text)
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
 
-          if [ "$CALLER_ARN" != \
-            "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
+          if [ "$CALLER_ARN" != "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
             echo "Wrong IAM User"
             exit 1
           fi
+
+          echo "AWS IAM User authentication successful"
 
       # 8. Setup kubectl
       - name: Setup kubectl
@@ -83,6 +83,10 @@ jobs:
       # 9. Connect to EKS
       - name: Connect to EKS
         run: |
+          aws eks describe-cluster \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER_NAME"
@@ -93,15 +97,14 @@ jobs:
       - name: Apply Namespace
         run: |
           kubectl apply -f k8t/namespace.yaml
+          kubectl get namespaces
 
       # 11. Deploy Application
       - name: Deploy Python Application
         run: |
-          kubectl apply -f k8t/deployment.yaml \
-            -n "$NAMESPACE"
+          kubectl apply -f k8t/deployment.yaml -n "$NAMESPACE"
 
-          kubectl apply -f k8t/service.yaml \
-            -n "$NAMESPACE"
+          kubectl apply -f k8t/service.yaml -n "$NAMESPACE"
 
           kubectl set image deployment/pyapp \
             pyapp="$DOCKER_IMAGE:$IMAGE_TAG" \
@@ -124,8 +127,7 @@ jobs:
             -n kube-system \
             --timeout=180s
 
-          kubectl get deployment metrics-server \
-            -n kube-system
+          kubectl get deployment metrics-server -n kube-system
 
       # 14. Wait for Metrics API
       - name: Wait for Metrics API
@@ -146,8 +148,7 @@ jobs:
       # 15. Apply HPA
       - name: Apply HPA
         run: |
-          kubectl apply -f k8t/hpa.yaml \
-            -n "$NAMESPACE"
+          kubectl apply -f k8t/hpa.yaml -n "$NAMESPACE"
 
       # 16. Verify HPA
       - name: Verify HPA
