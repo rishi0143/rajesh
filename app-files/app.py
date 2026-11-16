@@ -1,3 +1,5 @@
+
+
 import os
 from flask import Flask, render_template, request, redirect, url_for, flash
 from database import get_connection, init_db
@@ -16,17 +18,19 @@ def index():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    cursor.execute("""
-        SELECT * FROM buses
-        ORDER BY departure_time
-    """)
+    try:
+        cursor.execute("""
+            SELECT * FROM buses
+            ORDER BY departure_time
+        """)
 
-    buses = cursor.fetchall()
+        buses = cursor.fetchall()
 
-    cursor.close()
-    conn.close()
+        return render_template("index.html", buses=buses)
 
-    return render_template("index.html", buses=buses)
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route("/book", methods=["POST"])
@@ -36,10 +40,16 @@ def book_ticket():
     phone = request.form.get("phone")
     bus_id = request.form.get("bus_id")
 
+    if not passenger or not phone or not bus_id:
+        flash("Please fill all required fields.", "error")
+        return redirect(url_for("index"))
+
     try:
         seats = int(request.form.get("seats", 1))
+
         if seats < 1 or seats > 6:
             raise ValueError
+
     except ValueError:
         flash("Please select between 1 and 6 seats.", "error")
         return redirect(url_for("index"))
@@ -54,6 +64,7 @@ def book_ticket():
             "SELECT * FROM buses WHERE id=%s FOR UPDATE",
             (bus_id,)
         )
+
         bus = cursor.fetchone()
 
         if not bus:
@@ -62,10 +73,14 @@ def book_ticket():
             return redirect(url_for("index"))
 
         cursor.execute(
-            "SELECT COALESCE(SUM(seats), 0) AS booked "
-            "FROM bookings WHERE bus_id=%s",
+            """
+            SELECT COALESCE(SUM(seats), 0) AS booked
+            FROM bookings
+            WHERE bus_id=%s
+            """,
             (bus_id,)
         )
+
         booked = cursor.fetchone()["booked"]
 
         if booked + seats > bus["total_seats"]:
@@ -82,6 +97,7 @@ def book_ticket():
         """, (bus_id, passenger, phone, seats, total))
 
         booking_id = cursor.lastrowid
+
         conn.commit()
 
         flash(
@@ -110,39 +126,49 @@ def my_bookings():
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    cursor.execute("""
-        SELECT bookings.*, buses.operator,
-               buses.source, buses.destination,
-               buses.departure_time
-        FROM bookings
-        JOIN buses ON bookings.bus_id = buses.id
-        WHERE bookings.phone=%s
-        ORDER BY bookings.id DESC
-    """, (phone,))
+    try:
+        cursor.execute("""
+            SELECT bookings.*, buses.operator,
+                   buses.source, buses.destination,
+                   buses.departure_time
+            FROM bookings
+            JOIN buses ON bookings.bus_id = buses.id
+            WHERE bookings.phone=%s
+            ORDER BY bookings.id DESC
+        """, (phone,))
 
-    bookings = cursor.fetchall()
+        bookings = cursor.fetchall()
 
-    cursor.close()
-    conn.close()
+        return render_template(
+            "bookings.html",
+            bookings=bookings,
+            phone=phone
+        )
 
-    return render_template(
-        "bookings.html",
-        bookings=bookings,
-        phone=phone
-    )
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @app.route("/health")
 def health():
+
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1")
-    cursor.close()
-    conn.close()
 
-    return {"status": "healthy", "database": "connected"}
+    try:
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+
+        return {
+            "status": "healthy",
+            "database": "connected"
+        }
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-    
