@@ -1,5 +1,5 @@
 
-name: GoBus-KubeCI-CD
+name: GoBus-KubeCI-CD-Monitoring
 
 on:
   push:
@@ -22,19 +22,30 @@ env:
 
 jobs:
 
+  # JOB 1: Build Docker Image and Update Kubernetes Manifest
   PythonCI:
-    name: Docker Build and Push
+    name: Build and Push Docker Image
     runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      revision: ${{ steps.update_manifest.outputs.revision }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
-      - name: Generate Image Version
+      - name: Generate Image Tag
+        id: build
         run: |
           IMAGE_TAG="${GITHUB_SHA::7}"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-          echo "IMAGE=$DOCKER_IMAGE:$IMAGE_TAG" >> "$GITHUB_ENV"
+          IMAGE="${DOCKER_IMAGE}:${IMAGE_TAG}"
+
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
       - name: Docker Hub Login
         uses: docker/login-action@v3
@@ -42,12 +53,11 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build Docker Image
-        run: docker build -t "$IMAGE" ./app-files
-
-      - name: Push Docker Image
+      - name: Build and Push Docker Image
         run: |
+          docker build -t "$IMAGE" ./app-files
           docker push "$IMAGE"
+
           docker tag "$IMAGE" "$DOCKER_IMAGE:latest"
           docker push "$DOCKER_IMAGE:latest"
 
@@ -56,14 +66,17 @@ jobs:
           sudo wget -qO /usr/local/bin/yq \
             https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+          yq --version
 
       - name: Update Kubernetes Deployment Image
+        id: update_manifest
         run: |
           export IMAGE
-          yq -i '(.spec.template.spec.containers[] | select(.name == "pyapp").image) = strenv(IMAGE)' "$MANIFEST_FILE"
 
-      - name: Commit and Push Manifest
-        run: |
+          yq -i '(.spec.template.spec.containers[] |
+            select(.name == "pyapp").image) = strenv(IMAGE)' \
+            "$MANIFEST_FILE"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -71,13 +84,21 @@ jobs:
 
           if ! git diff --cached --quiet; then
             git commit -m "Update GoBus image to $IMAGE_TAG"
-            git push origin HEAD:main
-          else
-            echo "No manifest changes"
           fi
 
+          git push origin HEAD:main
+
+          REVISION=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+          echo "Updated image: $IMAGE"
+          echo "Git revision: $REVISION"
+
+
+  # JOB 2: Verify EKS, Argo CD, HPA and Monitoring
   VerifyDeployment:
-    name: Verify EKS, Argo CD and HPA
+    name: Verify EKS and Monitoring
     runs-on: ubuntu-latest
     needs: PythonCI
 
@@ -89,63 +110,144 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install kubectl
-        run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          sudo install kubectl /usr/local/bin/kubectl
-
       - name: Configure EKS
         run: |
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION"
 
-      - name: Verify EKS
-        run: kubectl get nodes
+          kubectl get nodes
 
+      # ARGO CD VERIFICATION
       - name: Verify Argo CD Application
+        env:
+          EXPECTED_REVISION: ${{ needs.PythonCI.outputs.revision }}
         run: |
-          kubectl get applications.argoproj.io gobus -n argocd
-          kubectl get applications.argoproj.io gobus -n argocd \
-            -o jsonpath='{.status.sync.status}{" | "}{.status.health.status}{"\n"}'
+          echo "Refreshing Argo CD application"
 
-      - name: Wait for Argo CD Deployment
-        run: |
-          EXPECTED_IMAGE="$DOCKER_IMAGE:${GITHUB_SHA::7}"
+          kubectl annotate application gobus -n argocd \
+            argocd.argoproj.io/refresh=hard --overwrite
 
-          for i in $(seq 1 60); do
-            CURRENT_IMAGE=$(kubectl get deployment pyapp \
-              -n "$NAMESPACE" \
-              -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}' \
-              2>/dev/null || true)
+          echo "Waiting for Argo CD Sync and Healthy status"
 
-            echo "Current: $CURRENT_IMAGE"
-            echo "Expected: $EXPECTED_IMAGE"
+          for i in $(seq 1 30); do
 
-            if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
-              echo "Argo CD image update successful"
-              exit 0
+            SYNC=$(kubectl get application gobus -n argocd \
+              -o jsonpath='{.status.sync.status}')
+
+            HEALTH=$(kubectl get application gobus -n argocd \
+              -o jsonpath='{.status.health.status}')
+
+            REVISION=$(kubectl get application gobus -n argocd \
+              -o jsonpath='{.status.sync.revision}')
+
+            echo "Sync: $SYNC | Health: $HEALTH"
+            echo "Revision: $REVISION"
+
+            if [ "$SYNC" = "Synced" ] && \
+               [ "$HEALTH" = "Healthy" ] && \
+               [ "$REVISION" = "$EXPECTED_REVISION" ]; then
+              echo "Argo CD Sync and Health successful"
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "Argo CD verification failed"
+              kubectl describe application gobus -n argocd
+              exit 1
             fi
 
             sleep 10
           done
 
-          echo "Argo CD image update timed out"
-          exit 1
-
-      - name: Verify Rollout
+      # KUBERNETES DEPLOYMENT
+      - name: Verify Kubernetes Deployment
+        env:
+          EXPECTED_IMAGE: ${{ needs.PythonCI.outputs.image }}
         run: |
           kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" --timeout=300s
+
+          ACTUAL_IMAGE=$(kubectl get deployment pyapp \
             -n "$NAMESPACE" \
-            --timeout=5m
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}')
 
-      - name: Verify Pods and HPA
-        run: |
-          kubectl get pods -n "$NAMESPACE"
+          echo "Expected image: $EXPECTED_IMAGE"
+          echo "Actual image: $ACTUAL_IMAGE"
+
+          if [ "$ACTUAL_IMAGE" != "$EXPECTED_IMAGE" ]; then
+            echo "Image verification failed"
+            exit 1
+          fi
+
           kubectl get deployment pyapp -n "$NAMESPACE"
-          kubectl get hpa -n "$NAMESPACE"
-          kubectl top pods -n "$NAMESPACE"
+          kubectl get pods -n "$NAMESPACE" -o wide
+          kubectl get svc -n "$NAMESPACE"
 
-      - name: Final Argo CD Status
+      # HPA VERIFICATION
+      - name: Verify HPA Autoscaling
         run: |
-          kubectl get applications.argoproj.io gobus -n argocd
+          echo "===== HPA STATUS ====="
+
+          kubectl get hpa -n "$NAMESPACE"
+
+          kubectl describe hpa gobus-hpa -n "$NAMESPACE"
+
+          echo "===== POD CPU AND MEMORY ====="
+
+          for i in $(seq 1 6); do
+            if kubectl top pods -n "$NAMESPACE"; then
+              break
+            fi
+
+            echo "Waiting for CPU metrics..."
+            sleep 10
+          done
+
+          kubectl get hpa gobus-hpa -n "$NAMESPACE"
+
+      # PROMETHEUS VERIFICATION
+      - name: Verify Prometheus
+        run: |
+          echo "===== PROMETHEUS ====="
+
+          kubectl get statefulset \
+            prometheus-gobus-monitoring-kube-prom-prometheus \
+            -n monitoring
+
+          kubectl get svc \
+            gobus-monitoring-kube-prom-prometheus \
+            -n monitoring
+
+          kubectl rollout status statefulset/\
+             prometheus-gobus-monitoring-kube-prom-prometheus \
+            -n monitoring --timeout=180s
+
+      # GRAFANA VERIFICATION
+      - name: Verify Grafana
+        run: |
+          echo "===== GRAFANA ====="
+
+          kubectl get deployment \
+            gobus-monitoring-grafana \
+            -n monitoring
+
+          kubectl get svc \
+            gobus-monitoring-grafana \
+            -n monitoring
+
+          kubectl rollout status deployment/\
+gobus-monitoring-grafana \
+            -n monitoring --timeout=180s
+
+      # FINAL STATUS
+      - name: Final Project Status
+        run: |
+          echo "===== GOBUS FINAL STATUS ====="
+
+          kubectl get pods -n gobus
+          kubectl get hpa -n gobus
+          kubectl get applications -n argocd
+          kubectl get pods -n monitoring
+
+          echo "GoBus CI/CD verification completed!"
