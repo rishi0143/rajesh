@@ -1,34 +1,6 @@
+
+
 apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: pyapp
-spec:
-  replicas: 2
-
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
-
-  selector:
-    matchLabels:
-      app: pyapp
-
-  template:
-    metadata:
-      labels:
-        app: pyapp
-    spec:
-      containers:
-        - name: pyapp
-          image: rishi784/gha-pyapp:d4b4a50
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 5000
-          resources:
-            requests:
-              cpu: 100mapiVersion: apps/v1
 kind: Deployment
 metadata:
   name: pyapp
