@@ -8,10 +8,8 @@ on:
 
   workflow_dispatch:
 
-# GitHub OIDC permissions
 permissions:
   contents: read
-  id-token: write
 
 env:
   AWS_REGION: ap-south-1
@@ -54,11 +52,12 @@ jobs:
           docker push "$DOCKER_IMAGE:$IMAGE_TAG"
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS Credentials using OIDC
+      # 6. Configure AWS Credentials using old keys
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::479537130944:role/gobus-github-deploy
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       # 7. Verify AWS Identity
@@ -68,12 +67,12 @@ jobs:
 
           CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
 
-          if [[ "$CALLER_ARN" != arn:aws:sts::479537130944:assumed-role/gobus-github-deploy/* ]]; then
-            echo "Wrong IAM Role"
+          if [ "$CALLER_ARN" != "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
+            echo "Wrong IAM User"
             exit 1
           fi
 
-          echo "OIDC authentication successful"
+          echo "AWS IAM User authentication successful"
 
       # 8. Setup kubectl
       - name: Setup kubectl
@@ -98,7 +97,6 @@ jobs:
       - name: Apply Namespace
         run: |
           kubectl apply -f k8t/namespace.yaml
-
           kubectl get namespaces
 
       # 11. Deploy Application
@@ -194,26 +192,24 @@ jobs:
       - name: Debug Failure
         if: failure()
         run: |
-          echo "===== Nodes ====="
           kubectl get nodes || true
 
-          echo "===== Pods ====="
-          kubectl get pods -n "$NAMESPACE" -o wide || true
+          kubectl get pods \
+            -n "$NAMESPACE" -o wide || true
 
-          echo "===== Deployment ====="
-          kubectl get deployment -n "$NAMESPACE" || true
+          kubectl get deployment \
+            -n "$NAMESPACE" || true
 
-          echo "===== Services ====="
-          kubectl get svc -n "$NAMESPACE" || true
+          kubectl get svc \
+            -n "$NAMESPACE" || true
 
-          echo "===== HPA ====="
-          kubectl get hpa -n "$NAMESPACE" || true
+          kubectl get hpa \
+            -n "$NAMESPACE" || true
 
-          echo "===== Events ====="
-          kubectl get events -n "$NAMESPACE" \
+          kubectl get events \
+            -n "$NAMESPACE" \
             --sort-by=.lastTimestamp || true
 
-          echo "===== Application Logs ====="
           kubectl logs deployment/pyapp \
             -n "$NAMESPACE" \
             --tail=100 || true
