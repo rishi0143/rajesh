@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GoBus Admin Dashboard</title>
+</head>
+<body>
+
+    <h1>GoBus Admin Dashboard</h1>
+
+    <h2>Total Buses: {{ total_buses }}</h2>
+    <h2>Total Bookings: {{ total_bookings }}</h2>
+    <h2>Total Revenue: ₹{{ revenue }}</h2>
+
+    <h2>Passenger Booking Details</h2>
+
+    <table border="1" cellpadding="10">
+        <tr>
+            <th>Booking ID</th>
+            <th>Passenger</th>
+            <th>Phone</th>
+            <th>Bus</th>
+            <th>Route</th>
+            <th>Seats</th>
+            <th>Amount</th>
+        </tr>
+
+        {% for booking in bookings %}
+        <tr>
+            <td>{{ booking.id }}</td>
+            <td>{{ booking.passenger }}</td>
+            <td>{{ booking.phone }}</td>
+            <td>{{ booking.operator }}</td>
+            <td>{{ booking.source }} - {{ booking.destination }}</td>
+            <td>{{ booking.seats }}</td>
+            <td>₹{{ booking.total_amount }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+
+    <br>
+    <a href="/owner/logout">Logout</a>
+
+</body>
+</html>

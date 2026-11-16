@@ -1,0 +1,16 @@
+# Secrets
+.env
+.env.*
+db.env
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Logs
+*.log
