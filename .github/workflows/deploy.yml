@@ -99,3 +99,132 @@ jobs:
           echo "Namespace: $NAMESPACE"
           echo "Argo CD will sync the new version"
           echo "================================"
+
+          # 6. Configure AWS Credentials using old keys
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 7. Verify AWS Identity
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
+          if [ "$CALLER_ARN" != "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
+            echo "Wrong IAM User"
+            exit 1
+          fi
+          echo "AWS IAM User authentication successful"
+      # 8. Setup kubectl
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.0
+
+      # 9. Connect to EKS
+      - name: Connect to EKS
+        run: |
+          aws eks describe-cluster \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl get nodes
+      # 10. Apply Namespace
+      - name: Apply Namespace
+        run: |
+          kubectl apply -f k8t/namespace.yaml
+          kubectl get namespaces
+      # 11. Deploy Application
+      - name: Deploy Python Application
+        run: |
+          kubectl apply -f k8t/deployment.yaml -n "$NAMESPACE"
+          kubectl apply -f k8t/service.yaml -n "$NAMESPACE"
+          kubectl set image deployment/pyapp \
+            pyapp="$DOCKER_IMAGE:$IMAGE_TAG" \
+            -n "$NAMESPACE"
+          kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" \
+            --timeout=300s
+      # 12. Install Metrics Server
+      - name: Install Metrics Server
+        run: |
+          kubectl apply -f \
+            https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      # 13. Verify Metrics Server
+      - name: Verify Metrics Server
+        run: |
+          kubectl rollout status deployment/metrics-server \
+            -n kube-system \
+            --timeout=180s
+          kubectl get deployment metrics-server -n kube-system
+      # 14. Wait for Metrics API
+      - name: Wait for Metrics API
+        run: |
+          for i in {1..18}; do
+            if kubectl top nodes; then
+              echo "Metrics API is ready"
+              exit 0
+            fi
+            echo "Waiting for Metrics API..."
+            sleep 10
+          done
+          echo "Metrics API is not ready"
+          exit 1
+      # 15. Apply HPA
+      - name: Apply HPA
+        run: |
+          kubectl apply -f k8t/hpa.yaml -n "$NAMESPACE"
+      # 16. Verify HPA
+      - name: Verify HPA
+        run: |
+          kubectl get hpa -n "$NAMESPACE"
+          kubectl describe hpa gobus-hpa \
+            -n "$NAMESPACE"
+      # 17. Final Verification
+      - name: Final Verification
+        run: |
+          echo "===== EKS Nodes ====="
+          kubectl get nodes
+          echo "===== Pods ====="
+          kubectl get pods -n "$NAMESPACE" -o wide
+          echo "===== Deployment ====="
+          kubectl get deployment -n "$NAMESPACE"
+          echo "===== Services ====="
+          kubectl get svc -n "$NAMESPACE"
+          echo "===== Metrics Server ====="
+          kubectl get pods -n kube-system \
+            -l k8s-app=metrics-server
+          echo "===== HPA ====="
+          kubectl get hpa -n "$NAMESPACE"
+          echo "===== Pod Metrics ====="
+          kubectl top pods -n "$NAMESPACE"
+          echo "===== Deployed Image ====="
+          kubectl get deployment pyapp \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+      # 18. Debug Failure
+      - name: Debug Failure
+        if: failure()
+        run: |
+          kubectl get nodes || true
+          kubectl get pods \
+            -n "$NAMESPACE" -o wide || true
+          kubectl get deployment \
+            -n "$NAMESPACE" || true
+          kubectl get svc \
+            -n "$NAMESPACE" || true
+          kubectl get hpa \
+            -n "$NAMESPACE" || true
+          kubectl get events \
+            -n "$NAMESPACE" \
+            --sort-by=.lastTimestamp || true
+          kubectl logs deployment/pyapp \
+            -n "$NAMESPACE" \
+            --tail=100 || true
+
+          
