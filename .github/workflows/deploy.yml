@@ -1,4 +1,4 @@
-```yaml
+
 name: GoBus-KubeCI-CD
 
 on:
@@ -149,4 +149,3 @@ jobs:
       - name: Final Argo CD Status
         run: |
           kubectl get applications.argoproj.io gobus -n argocd
-```
