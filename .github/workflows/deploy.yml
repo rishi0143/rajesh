@@ -1,5 +1,4 @@
 
-
 name: GoBus-KubeCI-CD-Monitoring
 
 on:
@@ -33,10 +32,6 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
 
-    outputs:
-      image: ${{ steps.image.outputs.image }}
-      revision: ${{ steps.revision.outputs.revision }}
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -50,10 +45,9 @@ jobs:
           IMAGE_TAG="${GITHUB_SHA::7}"
           IMAGE="${DOCKER_IMAGE}:${IMAGE_TAG}"
 
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
 
-          echo "Building image: ${IMAGE}"
+          echo "Docker image: ${IMAGE}"
 
       - name: Docker Hub Login
         uses: docker/login-action@v3
@@ -67,7 +61,7 @@ jobs:
           context: ./app-files
           push: true
           tags: |
-            ${{ steps.image.outputs.image }}
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
             ${{ env.DOCKER_IMAGE }}:latest
 
       - name: Install yq
@@ -75,18 +69,19 @@ jobs:
           sudo wget -q \
             https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 \
             -O /usr/local/bin/yq
+
           sudo chmod +x /usr/local/bin/yq
           yq --version
 
       - name: Update Kubernetes Deployment Manifest
         run: |
-          IMAGE="${{ steps.image.outputs.image }}"
+          IMAGE="${DOCKER_IMAGE}:${GITHUB_SHA:0:7}"
 
           yq -i \
             '(.spec.template.spec.containers[] | select(.name == "pyapp").image) = strenv(IMAGE)' \
             "$MANIFEST_FILE"
 
-          echo "Updated manifest image:"
+          echo "Updated Kubernetes image:"
           yq '.spec.template.spec.containers[] | select(.name == "pyapp").image' "$MANIFEST_FILE"
 
       - name: Commit and Push Manifest
@@ -97,46 +92,34 @@ jobs:
           git add "$MANIFEST_FILE"
 
           if git diff --cached --quiet; then
-            echo "No manifest changes to commit"
+            echo "Manifest already has the expected image"
           else
             git commit -m "Update GoBus image to ${IMAGE}"
             git push origin HEAD:main
           fi
 
-      - name: Get Latest Git Revision
-        id: revision
+      - name: Verify Docker Image
         run: |
-          git fetch origin main
-          REVISION=$(git ls-remote origin refs/heads/main | awk '{print $1}')
-
-          if [ -z "$REVISION" ]; then
-            echo "Unable to get latest Git revision"
-            exit 1
-          fi
-
-          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
-          echo "Expected Git revision: ${REVISION}"
+          echo "===== DOCKER IMAGE ====="
+          echo "Expected image: ${DOCKER_IMAGE}:${GITHUB_SHA:0:7}"
+          docker buildx imagetools inspect \
+            "${DOCKER_IMAGE}:${GITHUB_SHA:0:7}"
 
   # ==========================================
-  # JOB 2: VERIFY ARGO CD, KUBERNETES,
-  # HPA, PROMETHEUS AND GRAFANA
+  # JOB 2: DEPLOYMENT AND MONITORING VERIFICATION
   # ==========================================
   VerifyDeployment:
     name: Verify Deployment and Monitoring
     runs-on: ubuntu-latest
     needs: PythonCI
 
-    env:
-      EXPECTED_IMAGE: ${{ needs.PythonCI.outputs.image }}
-      EXPECTED_REVISION: ${{ needs.PythonCI.outputs.revision }}
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ------------------------------------------
-      # AWS AND EKS CONNECTION
-      # ------------------------------------------
+      # ==========================================
+      # AWS CREDENTIALS
+      # ==========================================
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -144,6 +127,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # ==========================================
+      # EKS CONNECTION
+      # ==========================================
       - name: Connect to EKS Cluster
         run: |
           aws eks update-kubeconfig \
@@ -153,12 +139,14 @@ jobs:
           echo "===== EKS NODES ====="
           kubectl get nodes
 
-      # ------------------------------------------
+      # ==========================================
       # ARGO CD VERIFICATION
-      # ------------------------------------------
+      # ==========================================
       - name: Verify Argo CD Sync and Health
         run: |
           echo "===== ARGO CD VERIFICATION ====="
+
+          EXPECTED_IMAGE="${DOCKER_IMAGE}:${GITHUB_SHA:0:7}"
 
           kubectl annotate application gobus \
             -n argocd \
@@ -168,6 +156,7 @@ jobs:
           SUCCESS=false
 
           for i in $(seq 1 30); do
+
             SYNC_STATUS=$(kubectl get application gobus \
               -n argocd \
               -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
@@ -176,18 +165,21 @@ jobs:
               -n argocd \
               -o jsonpath='{.status.health.status}' 2>/dev/null || true)
 
-            ACTUAL_REVISION=$(kubectl get application gobus \
-              -n argocd \
-              -o jsonpath='{.status.sync.revision}' 2>/dev/null || true)
+            ACTUAL_IMAGE=$(kubectl get deployment pyapp \
+              -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}' \
+              2>/dev/null || true)
 
             echo "Attempt: $i"
-            echo "Sync: $SYNC_STATUS"
-            echo "Health: $HEALTH_STATUS"
-            echo "Revision: $ACTUAL_REVISION"
+            echo "Argo Sync: $SYNC_STATUS"
+            echo "Argo Health: $HEALTH_STATUS"
+            echo "Expected image: $EXPECTED_IMAGE"
+            echo "Actual image: $ACTUAL_IMAGE"
 
             if [ "$SYNC_STATUS" = "Synced" ] && \
                [ "$HEALTH_STATUS" = "Healthy" ] && \
-               [ "$ACTUAL_REVISION" = "$EXPECTED_REVISION" ]; then
+               [ "$ACTUAL_IMAGE" = "$EXPECTED_IMAGE" ]; then
+
               SUCCESS=true
               break
             fi
@@ -197,23 +189,25 @@ jobs:
 
           if [ "$SUCCESS" != "true" ]; then
             echo "Argo CD verification failed"
-            kubectl describe application gobus -n argocd
+
+            kubectl describe application gobus -n argocd || true
+            kubectl describe deployment pyapp -n "$NAMESPACE" || true
+
             exit 1
           fi
 
-          echo "Argo CD Synced and Healthy"
+          echo "Argo CD Synced, Healthy and expected image detected"
 
-      # ------------------------------------------
+      # ==========================================
       # KUBERNETES DEPLOYMENT VERIFICATION
-      # ------------------------------------------
+      # ==========================================
       - name: Verify Kubernetes Deployment
         run: |
           echo "===== KUBERNETES DEPLOYMENT ====="
 
-          if [ -z "$EXPECTED_IMAGE" ]; then
-            echo "ERROR: Expected image output is empty"
-            exit 1
-          fi
+          EXPECTED_IMAGE="${DOCKER_IMAGE}:${GITHUB_SHA:0:7}"
+
+          echo "Expected image: $EXPECTED_IMAGE"
 
           kubectl rollout status deployment/pyapp \
             -n "$NAMESPACE" \
@@ -242,14 +236,15 @@ jobs:
           echo "===== SERVICES ====="
           kubectl get services -n "$NAMESPACE"
 
-      # ------------------------------------------
+      # ==========================================
       # HPA VERIFICATION
-      # ------------------------------------------
+      # ==========================================
       - name: Verify HPA
         run: |
           echo "===== HPA VERIFICATION ====="
 
           kubectl get hpa gobus-hpa -n "$NAMESPACE"
+
           kubectl describe hpa gobus-hpa -n "$NAMESPACE"
 
           METRICS_OK=false
@@ -269,11 +264,11 @@ jobs:
             exit 1
           fi
 
-          echo "HPA and pod metrics verification successful"
+          echo "HPA metrics verification successful"
 
-      # ------------------------------------------
+      # ==========================================
       # PROMETHEUS VERIFICATION
-      # ------------------------------------------
+      # ==========================================
       - name: Verify Prometheus
         run: |
           echo "===== PROMETHEUS VERIFICATION ====="
@@ -293,9 +288,9 @@ jobs:
 
           echo "Prometheus verification successful"
 
-      # ------------------------------------------
+      # ==========================================
       # GRAFANA VERIFICATION
-      # ------------------------------------------
+      # ==========================================
       - name: Verify Grafana
         run: |
           echo "===== GRAFANA VERIFICATION ====="
@@ -315,9 +310,9 @@ jobs:
 
           echo "Grafana verification successful"
 
-      # ------------------------------------------
-      # FINAL STATUS
-      # ------------------------------------------
+      # ==========================================
+      # FINAL PROJECT STATUS
+      # ==========================================
       - name: Final Project Status
         if: always()
         run: |
