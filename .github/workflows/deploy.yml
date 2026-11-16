@@ -1,5 +1,4 @@
 
-
 name: GoBus-KubeCI-CD-Monitoring
 
 on:
@@ -24,7 +23,7 @@ env:
 
 jobs:
 
-  # JOB 1: Docker Build and Push + GitOps Update
+  # JOB 1: Docker Build, Push and GitOps Update
   PythonCI:
     name: Docker Build and Push
     runs-on: ubuntu-latest
@@ -38,8 +37,8 @@ jobs:
       - name: Generate Image Version
         run: |
           IMAGE_TAG="${GITHUB_SHA::7}"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          echo "IMAGE=$DOCKER_IMAGE:$IMAGE_TAG" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "IMAGE=$DOCKER_IMAGE:$IMAGE_TAG" >> "$GITHUB_ENV"
 
       - name: Docker Hub Login
         uses: docker/login-action@v3
@@ -80,12 +79,12 @@ jobs:
             git commit -m "Update GoBus image to $IMAGE_TAG"
             git push origin HEAD:main
           else
-            echo "No manifest changes"
+            echo "No manifest changes to commit"
           fi
 
-  # JOB 2: Kubernetes + HPA + ArgoCD Deployment Verification
-  VerifyDeployment:
-    name: Verify EKS Deployment and HPA
+  # JOB 2: Prometheus and Grafana
+  Monitoring:
+    name: Install Prometheus and Grafana
     runs-on: ubuntu-latest
     needs: PythonCI
 
@@ -95,65 +94,11 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GoBusMonitoringSession
 
-      - name: Install kubectl
+      - name: Verify AWS Identity
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          sudo install kubectl /usr/local/bin/kubectl
-
-      - name: Configure EKS
-        run: |
-          aws eks update-kubeconfig \
-            --name "$EKS_CLUSTER_NAME" \
-            --region "$AWS_REGION"
-
-      - name: Wait for ArgoCD Deployment
-        run: |
-          EXPECTED_IMAGE="$DOCKER_IMAGE:${GITHUB_SHA::7}"
-          echo "Waiting for Argo CD to deploy: $EXPECTED_IMAGE"
-
-          for i in $(seq 1 60); do
-            CURRENT_IMAGE=$(kubectl get deployment pyapp -n "$NAMESPACE" \
-              -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}' 2>/dev/null || true)
-
-            if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
-              echo "Argo CD updated the deployment image."
-              break
-            fi
-
-            if [ "$i" -eq 60 ]; then
-              echo "Timed out waiting for Argo CD deployment."
-              exit 1
-            fi
-
-            sleep 10
-          done
-
-          kubectl rollout status deployment/pyapp \
-            -n "$NAMESPACE" --timeout=5m
-
-      - name: Verify Pods and HPA
-        run: |
-          kubectl get pods -n "$NAMESPACE"
-          kubectl get deployment -n "$NAMESPACE"
-          kubectl get hpa -n "$NAMESPACE"
-          kubectl top pods -n "$NAMESPACE"
-
-      - name: Verify Argo CD Application
-        run: |
-          kubectl get applications -n argocd
-
-  # JOB 3: Prometheus + Grafana Automatic Installation
-  Monitoring:
-    name: Install Prometheus and Grafana
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws sts get-caller-identity
 
       - name: Install kubectl
         run: |
@@ -170,14 +115,15 @@ jobs:
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION"
 
-      - name: Add Prometheus Helm Repository
+      - name: Create Monitoring Namespace
         run: |
           kubectl create namespace monitoring \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Add Prometheus Helm Repository
+        run: |
           helm repo add prometheus-community \
             https://prometheus-community.github.io/helm-charts
-
           helm repo update
 
       - name: Install or Upgrade Prometheus and Grafana
@@ -188,8 +134,79 @@ jobs:
             --wait \
             --timeout 15m
 
-      - name: Verify Prometheus and Grafana
+      - name: Verify Monitoring
         run: |
           kubectl get pods -n monitoring
           kubectl get svc -n monitoring
           helm list -n monitoring
+
+  # JOB 3: Kubernetes, HPA and Argo CD Verification
+  VerifyDeployment:
+    name: Verify EKS Deployment and HPA
+    runs-on: ubuntu-latest
+    needs:
+      - PythonCI
+      - Monitoring
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GoBusDeploySession
+
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install kubectl /usr/local/bin/kubectl
+
+      - name: Configure EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Wait for Argo CD Image Update
+        run: |
+          EXPECTED_IMAGE="$DOCKER_IMAGE:${GITHUB_SHA::7}"
+          echo "Expected image: $EXPECTED_IMAGE"
+
+          for i in $(seq 1 60); do
+            CURRENT_IMAGE=$(kubectl get deployment pyapp \
+              -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}' \
+              2>/dev/null || true)
+
+            if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
+              echo "Deployment image updated successfully"
+              break
+            fi
+
+            if [ "$i" -eq 60 ]; then
+              echo "Argo CD deployment image update timed out"
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+      - name: Verify Kubernetes Rollout
+        run: |
+          kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" --timeout=5m
+
+      - name: Verify Pods and HPA
+        run: |
+          kubectl get pods -n "$NAMESPACE"
+          kubectl get deployment -n "$NAMESPACE"
+          kubectl get hpa -n "$NAMESPACE"
+          kubectl top pods -n "$NAMESPACE"
+
+      - name: Verify Argo CD Application
+        run: |
+          kubectl get applications -n argocd
