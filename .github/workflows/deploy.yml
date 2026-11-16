@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write
 
 env:
   AWS_REGION: ap-south-1
@@ -23,7 +22,7 @@ env:
 
 jobs:
 
-  # JOB 1: Build Docker Image, Push and Update GitOps Manifest
+  # JOB 1: Docker Build, Push and GitOps Update
   PythonCI:
     name: Docker Build and Push
     runs-on: ubuntu-latest
@@ -83,7 +82,7 @@ jobs:
             echo "No manifest changes to commit"
           fi
 
-  # JOB 2: Install or Upgrade Prometheus and Grafana
+  # JOB 2: Prometheus and Grafana
   Monitoring:
     name: Install Prometheus and Grafana
     runs-on: ubuntu-latest
@@ -93,9 +92,9 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GoBusMonitoringSession
 
       - name: Verify AWS Identity
         run: |
@@ -146,7 +145,7 @@ jobs:
           kubectl get svc -n monitoring
           helm list -n monitoring
 
-  # JOB 3: Verify Deployment, HPA and Argo CD
+  # JOB 3: EKS Deployment, HPA and Argo CD Verification
   VerifyDeployment:
     name: Verify EKS Deployment and HPA
     runs-on: ubuntu-latest
@@ -158,9 +157,9 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GoBusDeploySession
 
       - name: Verify AWS Identity
         run: |
@@ -182,8 +181,6 @@ jobs:
           kubectl get nodes
 
       - name: Wait for Argo CD Image Update
-        env:
-          EXPECTED_IMAGE: ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
         run: |
           EXPECTED_IMAGE="$DOCKER_IMAGE:${GITHUB_SHA::7}"
           echo "Expected image: $EXPECTED_IMAGE"
@@ -197,14 +194,14 @@ jobs:
             echo "Current image: $CURRENT_IMAGE"
 
             if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
-              echo "Argo CD updated the deployment image successfully"
+              echo "Argo CD updated deployment image successfully"
               exit 0
             fi
 
             sleep 10
           done
 
-          echo "Timed out waiting for Argo CD image update"
+          echo "Argo CD image update timed out"
           exit 1
 
       - name: Verify Kubernetes Rollout
@@ -223,7 +220,6 @@ jobs:
       - name: Verify Argo CD Application
         run: |
           kubectl get applications -n argocd
-          kubectl get application -n argocd --no-headers
 
       - name: Verify Monitoring Components
         run: |
