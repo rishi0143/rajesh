@@ -5,54 +5,83 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "k8t/deployment.yaml"
 
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   AWS_REGION: ap-south-1
   EKS_CLUSTER_NAME: gobus-eks
   DOCKER_IMAGE: rishi784/gha-pyapp
   NAMESPACE: gobus
+  MANIFEST_FILE: k8t/deployment.yaml
 
 jobs:
+
   PythonCI:
-    name: GoBus Docker EKS HPA CI-CD
+    name: Docker Build and Push
     runs-on: ubuntu-latest
 
     steps:
-
-      # 1. Checkout Source Code
-      - name: Git Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Generate Image Tag
-      - name: Set Image Tag
+      - name: Generate Image Version
         run: |
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "IMAGE=$DOCKER_IMAGE:$IMAGE_TAG" >> "$GITHUB_ENV"
 
-      # 3. Login to Docker Hub
-      - name: Login to Docker Hub
+      - name: Docker Hub Login
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 4. Build Docker Image
       - name: Build Docker Image
-        run: |
-          docker build -t "$DOCKER_IMAGE:$IMAGE_TAG" .
-          docker tag "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"
+        run: docker build -t "$IMAGE" ./app-files
 
-      # 5. Push Docker Image
       - name: Push Docker Image
         run: |
-          docker push "$DOCKER_IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE"
+          docker tag "$IMAGE" "$DOCKER_IMAGE:latest"
           docker push "$DOCKER_IMAGE:latest"
 
-      # 6. Configure AWS Credentials using old keys
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update Kubernetes Deployment Image
+        run: |
+          export IMAGE
+          yq -i '(.spec.template.spec.containers[] | select(.name == "pyapp").image) = strenv(IMAGE)' "$MANIFEST_FILE"
+
+      - name: Commit and Push Manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$MANIFEST_FILE"
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update GoBus image to $IMAGE_TAG"
+            git push origin HEAD:main
+          else
+            echo "No manifest changes"
+          fi
+
+  VerifyDeployment:
+    name: Verify EKS, Argo CD and HPA
+    runs-on: ubuntu-latest
+    needs: PythonCI
+
+    steps:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -60,156 +89,63 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 7. Verify AWS Identity
-      - name: Verify AWS Identity
+      - name: Install kubectl
         run: |
-          aws sts get-caller-identity
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install kubectl /usr/local/bin/kubectl
 
-          CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
-
-          if [ "$CALLER_ARN" != "arn:aws:iam::479537130944:user/gobus-github-deploy" ]; then
-            echo "Wrong IAM User"
-            exit 1
-          fi
-
-          echo "AWS IAM User authentication successful"
-
-      # 8. Setup kubectl
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: v1.34.0
-
-      # 9. Connect to EKS
-      - name: Connect to EKS
+      - name: Configure EKS
         run: |
-          aws eks describe-cluster \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
-
           aws eks update-kubeconfig \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
 
-          kubectl get nodes
+      - name: Verify EKS
+        run: kubectl get nodes
 
-      # 10. Apply Namespace
-      - name: Apply Namespace
+      - name: Verify Argo CD Application
         run: |
-          kubectl apply -f k8t/namespace.yaml
-          kubectl get namespaces
+          kubectl get applications.argoproj.io gobus -n argocd
+          kubectl get applications.argoproj.io gobus -n argocd \
+            -o jsonpath='{.status.sync.status}{" | "}{.status.health.status}{"\n"}'
 
-      # 11. Deploy Application
-      - name: Deploy Python Application
+      - name: Wait for Argo CD Deployment
         run: |
-          kubectl apply -f k8t/deployment.yaml -n "$NAMESPACE"
+          EXPECTED_IMAGE="$DOCKER_IMAGE:${GITHUB_SHA::7}"
 
-          kubectl apply -f k8t/service.yaml -n "$NAMESPACE"
+          for i in $(seq 1 60); do
+            CURRENT_IMAGE=$(kubectl get deployment pyapp \
+              -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}' \
+              2>/dev/null || true)
 
-          kubectl set image deployment/pyapp \
-            pyapp="$DOCKER_IMAGE:$IMAGE_TAG" \
-            -n "$NAMESPACE"
+            echo "Current: $CURRENT_IMAGE"
+            echo "Expected: $EXPECTED_IMAGE"
 
-          kubectl rollout status deployment/pyapp \
-            -n "$NAMESPACE" \
-            --timeout=300s
-
-      # 12. Install Metrics Server
-      - name: Install Metrics Server
-        run: |
-          kubectl apply -f \
-            https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-
-      # 13. Verify Metrics Server
-      - name: Verify Metrics Server
-        run: |
-          kubectl rollout status deployment/metrics-server \
-            -n kube-system \
-            --timeout=180s
-
-          kubectl get deployment metrics-server -n kube-system
-
-      # 14. Wait for Metrics API
-      - name: Wait for Metrics API
-        run: |
-          for i in {1..18}; do
-            if kubectl top nodes; then
-              echo "Metrics API is ready"
+            if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
+              echo "Argo CD image update successful"
               exit 0
             fi
 
-            echo "Waiting for Metrics API..."
             sleep 10
           done
 
-          echo "Metrics API is not ready"
+          echo "Argo CD image update timed out"
           exit 1
 
-      # 15. Apply HPA
-      - name: Apply HPA
+      - name: Verify Rollout
         run: |
-          kubectl apply -f k8t/hpa.yaml -n "$NAMESPACE"
+          kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" \
+            --timeout=5m
 
-      # 16. Verify HPA
-      - name: Verify HPA
+      - name: Verify Pods and HPA
         run: |
+          kubectl get pods -n "$NAMESPACE"
+          kubectl get deployment pyapp -n "$NAMESPACE"
           kubectl get hpa -n "$NAMESPACE"
-
-          kubectl describe hpa gobus-hpa \
-            -n "$NAMESPACE"
-
-      # 17. Final Verification
-      - name: Final Verification
-        run: |
-          echo "===== EKS Nodes ====="
-          kubectl get nodes
-
-          echo "===== Pods ====="
-          kubectl get pods -n "$NAMESPACE" -o wide
-
-          echo "===== Deployment ====="
-          kubectl get deployment -n "$NAMESPACE"
-
-          echo "===== Services ====="
-          kubectl get svc -n "$NAMESPACE"
-
-          echo "===== Metrics Server ====="
-          kubectl get pods -n kube-system \
-            -l k8s-app=metrics-server
-
-          echo "===== HPA ====="
-          kubectl get hpa -n "$NAMESPACE"
-
-          echo "===== Pod Metrics ====="
           kubectl top pods -n "$NAMESPACE"
 
-          echo "===== Deployed Image ====="
-          kubectl get deployment pyapp \
-            -n "$NAMESPACE" \
-            -o jsonpath='{.spec.template.spec.containers[0].image}'
-
-      # 18. Debug Failure
-      - name: Debug Failure
-        if: failure()
+      - name: Final Argo CD Status
         run: |
-          kubectl get nodes || true
-
-          kubectl get pods \
-            -n "$NAMESPACE" -o wide || true
-
-          kubectl get deployment \
-            -n "$NAMESPACE" || true
-
-          kubectl get svc \
-            -n "$NAMESPACE" || true
-
-          kubectl get hpa \
-            -n "$NAMESPACE" || true
-
-          kubectl get events \
-            -n "$NAMESPACE" \
-            --sort-by=.lastTimestamp || true
-
-          kubectl logs deployment/pyapp \
-            -n "$NAMESPACE" \
-            --tail=100 || true
+          kubectl get applications.argoproj.io gobus -n argocd
