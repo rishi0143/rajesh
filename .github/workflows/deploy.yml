@@ -1,5 +1,6 @@
 
-name: GoBus-KubeCI-CD
+
+name: GoBus-KubeCI-CD-Monitoring
 
 on:
   push:
@@ -9,12 +10,6 @@ on:
       - "k8t/deployment.yaml"
 
   workflow_dispatch:
-    inputs:
-      install_monitoring:
-        description: "Install Prometheus and Grafana"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -24,29 +19,29 @@ env:
   AWS_REGION: ap-south-1
   EKS_CLUSTER_NAME: gobus-eks
   DOCKER_IMAGE: rishi784/gha-pyapp
-  MANIFEST_FILE: k8t/deployment.yaml
   NAMESPACE: gobus
+  MANIFEST_FILE: k8t/deployment.yaml
 
 jobs:
 
-  # =====================================
-  # JOB 1: DOCKER BUILD AND GITOPS UPDATE
-  # =====================================
-
+  # JOB 1: Docker Build and Push + GitOps Update
   PythonCI:
-    name: GoBus Docker CI and ArgoCD CD
+    name: Docker Build and Push
     runs-on: ubuntu-latest
 
     steps:
-
-      - name: Git Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      - name: Set Image Tag
+      - name: Generate Image Version
         run: |
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "IMAGE=$DOCKER_IMAGE:$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Login to Docker Hub
+      - name: Docker Hub Login
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -54,39 +49,25 @@ jobs:
 
       - name: Build Docker Image
         run: |
-          docker build \
-            -t "$DOCKER_IMAGE:$IMAGE_TAG" \
-            -t "$DOCKER_IMAGE:latest" \
-            ./app-files
+          docker build -t "$IMAGE" ./app-files
 
       - name: Push Docker Image
         run: |
-          docker push "$DOCKER_IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE"
+          docker tag "$IMAGE" "$DOCKER_IMAGE:latest"
           docker push "$DOCKER_IMAGE:latest"
 
       - name: Install yq
         run: |
-          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
-            -O /usr/local/bin/yq
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
 
-      - name: Validate Deployment Manifest
+      - name: Update Kubernetes Deployment Image
         run: |
-          test -f "$MANIFEST_FILE"
-
-          yq -e \
-            '.spec.template.spec.containers[] | select(.name == "pyapp")' \
-            "$MANIFEST_FILE" > /dev/null
-
-      - name: Update Kubernetes Image Version
-        run: |
-          IMAGE="$DOCKER_IMAGE:$IMAGE_TAG" \
-          yq -i \
-            '(.spec.template.spec.containers[] | select(.name == "pyapp").image) = strenv(IMAGE)' \
-            "$MANIFEST_FILE"
-
-          echo "Updated image:"
-          yq '.spec.template.spec.containers[] | select(.name == "pyapp").image' "$MANIFEST_FILE"
+          export IMAGE
+          yq -i '(.spec.template.spec.containers[] | select(.name == "pyapp").image) = strenv(IMAGE)' "$MANIFEST_FILE"
+          cat "$MANIFEST_FILE"
 
       - name: Commit and Push Manifest
         run: |
@@ -95,38 +76,20 @@ jobs:
 
           git add "$MANIFEST_FILE"
 
-          if git diff --cached --quiet; then
+          if ! git diff --cached --quiet; then
+            git commit -m "Update GoBus image to $IMAGE_TAG"
+            git push origin HEAD:main
+          else
             echo "No manifest changes"
-            exit 0
           fi
 
-          git commit -m "Deploy GoBus version $IMAGE_TAG"
-
-          git pull --rebase origin main
-          git push origin HEAD:main
-
-      - name: CI Summary
-        run: |
-          echo "GoBus Docker CI completed"
-          echo "Image: $DOCKER_IMAGE:$IMAGE_TAG"
-          echo "Manifest: $MANIFEST_FILE"
-          echo "Argo CD will sync the new version"
-
-  # =====================================
-  # JOB 2: PROMETHEUS AND GRAFANA
-  # =====================================
-
-  Monitoring:
-    name: Install Prometheus and Grafana
+  # JOB 2: Kubernetes + HPA + ArgoCD Deployment Verification
+  VerifyDeployment:
+    name: Verify EKS Deployment and HPA
     runs-on: ubuntu-latest
-
-    if: github.event_name == 'workflow_dispatch' && inputs.install_monitoring == true
-
-    env:
-      MONITORING_NAMESPACE: monitoring
+    needs: PythonCI
 
     steps:
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -134,46 +97,99 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install kubectl /usr/local/bin/kubectl
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
-      - name: Connect to EKS
+      - name: Configure EKS
         run: |
           aws eks update-kubeconfig \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
 
-          kubectl get nodes
-
-      - name: Create Monitoring Namespace
+      - name: Wait for ArgoCD Deployment
         run: |
-          kubectl create namespace "$MONITORING_NAMESPACE" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          EXPECTED_IMAGE="$DOCKER_IMAGE:${GITHUB_SHA::7}"
+          echo "Waiting for Argo CD to deploy: $EXPECTED_IMAGE"
+
+          for i in $(seq 1 60); do
+            CURRENT_IMAGE=$(kubectl get deployment pyapp -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="pyapp")].image}' 2>/dev/null || true)
+
+            if [ "$CURRENT_IMAGE" = "$EXPECTED_IMAGE" ]; then
+              echo "Argo CD updated the deployment image."
+              break
+            fi
+
+            if [ "$i" -eq 60 ]; then
+              echo "Timed out waiting for Argo CD deployment."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          kubectl rollout status deployment/pyapp \
+            -n "$NAMESPACE" --timeout=5m
+
+      - name: Verify Pods and HPA
+        run: |
+          kubectl get pods -n "$NAMESPACE"
+          kubectl get deployment -n "$NAMESPACE"
+          kubectl get hpa -n "$NAMESPACE"
+          kubectl top pods -n "$NAMESPACE"
+
+      - name: Verify Argo CD Application
+        run: |
+          kubectl get applications -n argocd
+
+  # JOB 3: Prometheus + Grafana Automatic Installation
+  Monitoring:
+    name: Install Prometheus and Grafana
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install kubectl /usr/local/bin/kubectl
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Configure EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
 
       - name: Add Prometheus Helm Repository
         run: |
+          kubectl create namespace monitoring \
+            --dry-run=client -o yaml | kubectl apply -f -
+
           helm repo add prometheus-community \
             https://prometheus-community.github.io/helm-charts
 
           helm repo update
 
-      - name: Install Prometheus and Grafana
+      - name: Install or Upgrade Prometheus and Grafana
         run: |
           helm upgrade --install gobus-monitoring \
             prometheus-community/kube-prometheus-stack \
-            --namespace "$MONITORING_NAMESPACE" \
+            --namespace monitoring \
             --wait \
             --timeout 15m
 
-      - name: Verify Monitoring
+      - name: Verify Prometheus and Grafana
         run: |
           kubectl get pods -n monitoring
           kubectl get svc -n monitoring
-
-      - name: Monitoring Summary
-        run: |
-          echo "Prometheus and Grafana installation completed"
-          echo "Namespace: monitoring"
-          echo "Helm Release: gobus-monitoring"
+          helm list -n monitoring
