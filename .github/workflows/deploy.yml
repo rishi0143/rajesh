@@ -1,5 +1,4 @@
 
-```yaml
 name: GoBus-KubeCI-CD
 
 on:
@@ -183,4 +182,3 @@ jobs:
       - name: Verify Argo CD Application
         run: |
           kubectl get applications -n argocd
-```
