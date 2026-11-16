@@ -79,3 +79,46 @@ jobs:
 
           git commit -m "Deploy GoBus version $IMAGE_TAG"
           git push origin HEAD:main
+   # 6. Install yq
+      - name: Install yq
+        run: |
+          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+            -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      # 7. Update Kubernetes Deployment Image Version
+      - name: Update Deployment Version
+        run: |
+          IMAGE="$DOCKER_IMAGE:$IMAGE_TAG" \
+          yq -i \
+            '(.spec.template.spec.containers[] | select(.name == "pyapp").image) = strenv(IMAGE)' \
+            "$MANIFEST_FILE"
+
+          echo "New Docker Image:"
+          yq '.spec.template.spec.containers[] | select(.name == "pyapp").image' "$MANIFEST_FILE"
+
+      # 8. Commit and Push Updated Manifest
+      - name: Commit and Push Manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$MANIFEST_FILE"
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes"
+            exit 0
+          fi
+
+          git commit -m "Deploy GoBus version $IMAGE_TAG"
+          git push origin HEAD:main
+
+      # 9. Final CI Verification
+      - name: Pipeline Summary
+        run: |
+          echo "================================"
+          echo "GoBus CI completed successfully"
+          echo "Docker Image: $DOCKER_IMAGE:$IMAGE_TAG"
+          echo "Manifest: $MANIFEST_FILE"
+          echo "Namespace: $NAMESPACE"
+          echo "Argo CD will sync the new version"
