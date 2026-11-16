@@ -1,4 +1,4 @@
-```yaml
+
 name: GoBus-KubeCI-CD-Monitoring
 
 on:
@@ -229,4 +229,3 @@ jobs:
         run: |
           kubectl get pods -n monitoring
           kubectl get svc -n monitoring
-```
